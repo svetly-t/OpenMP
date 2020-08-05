@@ -18,12 +18,14 @@
 
 // this number is important!! it defines how big the game state array will be.
 // for now, I'm testing the server with a tick rate of 20, and a timeout value of 10 seconds.
-// as such, I've set this to 10*20 = 200
-const uint32_t TOTAL_STATES = 200;
+// as such, I've set this to 2*10*20 = 400
+const uint32_t TOTAL_STATES = 400;
+const uint32_t TICKS_PER_SEC = 20;
+const uint32_t TIMEOUT_SEC = 10;
 
 // this number is also important!! it is the state number of a client which hasn't received a packet
 // yet. set this to be larger than your TOTAL_STATES.
-const uint32_t DUMMY_STATE = 0xF0;
+const uint32_t DUMMY_STATE = 0xFFFFFFF7;
 // 
 //
 
@@ -35,13 +37,16 @@ struct Client_Pkt
 	float x; // 4 bytes
 	float y; // 4 bytes
 	float z; // 4 bytes
+	float xrot; // 4 bytes
+	float yrot; // 4 bytes
+	float zrot; // 4 bytes
+	uint32_t stamp; // 4 bytes
  	uint32_t ACK; // 4 bytes
 	uint8_t msgtype; // 1 byte
 	uint8_t pad2; // padding bytes
-	uint8_t pad3;
-	uint8_t pad4;
+	uint16_t msg_len; // 2 bytes
+	uint8_t msg[256]; // 256 bytes
 	// other possible fields:
-	// xrotation, yrotation, zrotation - 12 bytes
 	// head clothing - 2 (?) bytes
 	// body clothing / design - depends on implementation. 4 bytes?
 	// pant color - 4 bytes (RGB(A))
@@ -60,6 +65,7 @@ struct IDACK
 {
 	int32_t ID;
 	uint32_t ACK;
+	uint32_t stamp;
 	struct timeval time1;
 };
 
@@ -129,7 +135,7 @@ void remove_elem(void* list, uint32_t index, uint32_t len, uint32_t elem_size)
 	memset(list + (len - 1)*elem_size, 0, elem_size);
 }
 
-void add_to_send(int size, uint8_t ind_char, void* addr,
+void add_to_send(int size, uint8_t ind_char, void* addr, uint32_t* ACK,
 				 unsigned int* buffer_index, int* message_buffer_list_size, uint8_t** message_buffer_list)
 {
 	if (*buffer_index + size + 1 <= 1492)
@@ -137,6 +143,11 @@ void add_to_send(int size, uint8_t ind_char, void* addr,
 	}
 	else
 	{
+		for (int i = *buffer_index; i < 1492; i++)
+		{
+			message_buffer_list[*message_buffer_list_size - 1][i] = 'e';
+		}
+		
 		*message_buffer_list_size += 1;
 		if ( realloc((void*) message_buffer_list, *message_buffer_list_size * sizeof(uint8_t*)) == NULL )
 		{
@@ -148,7 +159,16 @@ void add_to_send(int size, uint8_t ind_char, void* addr,
 			printf("error with message_buffer_list malloc in add_to_send\n");
 			exit(2);
 		}
-		buffer_index = 0;
+		*buffer_index = 0;
+		
+		uint32_t ind = *message_buffer_list_size - 1;
+		message_buffer_list[ind][(*buffer_index)++] = 0x04; // indicating extention packet
+		
+		memcpy(message_buffer_list[ind] + (*buffer_index), ACK, sizeof(uint32_t));
+		*buffer_index += sizeof(uint32_t);
+
+		memcpy(message_buffer_list[ind] + (*buffer_index), &ind, sizeof(uint32_t));
+		*buffer_index += sizeof(uint32_t);
 	}
 	
 	int index = *message_buffer_list_size - 1;
@@ -261,7 +281,7 @@ void* send_func(void* void_in)
 			
 			uint8_t** message_buffer_list = NULL;
 			int message_buffer_list_size = 1;
-			unsigned int buffer_index = 1 + sizeof(uint32_t);
+			unsigned int buffer_index = 1 + sizeof(uint32_t) + sizeof(int32_t);
 			if ((message_buffer_list = malloc(sizeof(uint8_t*))) == NULL)
 			{
 				printf("error with message_buffer_list malloc in send_func\n");
@@ -298,7 +318,7 @@ void* send_func(void* void_in)
 						{
 							// compose diff
 							// increment both by 1
-							add_to_send(sizeof(int32_t), 'I', &(cur_clients[cur_counter].ID),
+							add_to_send(sizeof(int32_t), 'I', &(cur_clients[cur_counter].ID), send_struct->cur_state,
 							&buffer_index, &message_buffer_list_size, message_buffer_list);
 							
 							// message_buffer[buffer_index++] = 'I'; // to indicate ID
@@ -307,12 +327,12 @@ void* send_func(void* void_in)
 							
 							if (cur_clients[cur_counter].x != prev_clients[prev_counter].x)
 							{
-								add_to_send(sizeof(float), 'x', &(cur_clients[cur_counter].x),
+								add_to_send(sizeof(float), 'x', &(cur_clients[cur_counter].x), send_struct->cur_state,
 								&buffer_index, &message_buffer_list_size, message_buffer_list);
 							}
 							if (cur_clients[cur_counter].y != prev_clients[prev_counter].y)
 							{
-								add_to_send(sizeof(float), 'y', &(cur_clients[cur_counter].y),
+								add_to_send(sizeof(float), 'y', &(cur_clients[cur_counter].y), send_struct->cur_state,
 								&buffer_index, &message_buffer_list_size, message_buffer_list);
 
 								// message_buffer[buffer_index++] = 'y'; // to indicate new y
@@ -321,12 +341,42 @@ void* send_func(void* void_in)
 							}
 							if (cur_clients[cur_counter].z != prev_clients[prev_counter].z)
 							{
-								add_to_send(sizeof(float), 'z', &(cur_clients[cur_counter].z),
+								add_to_send(sizeof(float), 'z', &(cur_clients[cur_counter].z), send_struct->cur_state,
 								&buffer_index, &message_buffer_list_size, message_buffer_list);
 
 								// message_buffer[buffer_index++] = 'z'; // to indicate new z
 								// memcpy(message_buffer + buffer_index, &(cur_clients[cur_counter].z), sizeof(float));
 								// buffer_index += 4;
+							}
+							if (cur_clients[cur_counter].xrot != prev_clients[prev_counter].xrot)
+							{
+								add_to_send(sizeof(float), 'X', &(cur_clients[cur_counter].xrot), send_struct->cur_state,
+								&buffer_index, &message_buffer_list_size, message_buffer_list);
+							}
+							if (cur_clients[cur_counter].yrot != prev_clients[prev_counter].yrot)
+							{
+								add_to_send(sizeof(float), 'Y', &(cur_clients[cur_counter].yrot), send_struct->cur_state,
+								&buffer_index, &message_buffer_list_size, message_buffer_list);
+
+								// message_buffer[buffer_index++] = 'y'; // to indicate new y
+								// memcpy(message_buffer + buffer_index, &(cur_clients[cur_counter].y), sizeof(float));
+								// buffer_index += 4;
+							}
+							if (cur_clients[cur_counter].zrot != prev_clients[prev_counter].zrot)
+							{
+								add_to_send(sizeof(float), 'Z', &(cur_clients[cur_counter].zrot), send_struct->cur_state,
+								&buffer_index, &message_buffer_list_size, message_buffer_list);
+
+								// message_buffer[buffer_index++] = 'z'; // to indicate new z
+								// memcpy(message_buffer + buffer_index, &(cur_clients[cur_counter].z), sizeof(float));
+								// buffer_index += 4;
+							}
+							if (memcmp(cur_clients[cur_counter].msg, prev_clients[prev_counter].msg, 256) != 0)
+							{
+								add_to_send(sizeof(uint16_t), 'm', &(cur_clients[cur_counter].msg_len), send_struct->cur_state,
+								&buffer_index, &message_buffer_list_size, message_buffer_list);
+								add_to_send(cur_clients[cur_counter].msg_len, 't', cur_clients[cur_counter].msg, send_struct->cur_state,
+								&buffer_index, &message_buffer_list_size, message_buffer_list);
 							}
 						
 							cur_counter += 1;
@@ -350,7 +400,7 @@ void* send_func(void* void_in)
 							// 2 3 4
 							// where ID 1 dropped off and is no longer there
 							
-							add_to_send(sizeof(int32_t), 'i', &(cur_clients[cur_counter].ID),
+							add_to_send(sizeof(int32_t), 'i', &(prev_clients[prev_counter].ID), send_struct->cur_state,
 							&buffer_index, &message_buffer_list_size, message_buffer_list);
 							
 							// message_buffer[buffer_index++] = 'i'; // to indicate removed ID
@@ -370,15 +420,27 @@ void* send_func(void* void_in)
 						
 						// push cur_clients onto the update and inc by 1
 						
-						add_to_send(sizeof(int32_t), 'I', &(cur_clients[cur_counter].ID),
+						add_to_send(sizeof(int32_t), 'I', &(cur_clients[cur_counter].ID), send_struct->cur_state,
 						&buffer_index, &message_buffer_list_size, message_buffer_list);
-						add_to_send(sizeof(float), 'x', &(cur_clients[cur_counter].x),
+						add_to_send(sizeof(float), 'x', &(cur_clients[cur_counter].x), send_struct->cur_state,
 						&buffer_index, &message_buffer_list_size, message_buffer_list);
-						add_to_send(sizeof(float), 'y', &(cur_clients[cur_counter].y),
+						add_to_send(sizeof(float), 'y', &(cur_clients[cur_counter].y), send_struct->cur_state,
 						&buffer_index, &message_buffer_list_size, message_buffer_list);
-						add_to_send(sizeof(float), 'z', &(cur_clients[cur_counter].z),
+						add_to_send(sizeof(float), 'z', &(cur_clients[cur_counter].z), send_struct->cur_state,
 						&buffer_index, &message_buffer_list_size, message_buffer_list);
-
+						add_to_send(sizeof(float), 'X', &(cur_clients[cur_counter].xrot), send_struct->cur_state,
+						&buffer_index, &message_buffer_list_size, message_buffer_list);
+						add_to_send(sizeof(float), 'Y', &(cur_clients[cur_counter].yrot), send_struct->cur_state,
+						&buffer_index, &message_buffer_list_size, message_buffer_list);
+						add_to_send(sizeof(float), 'Z', &(cur_clients[cur_counter].zrot), send_struct->cur_state,
+						&buffer_index, &message_buffer_list_size, message_buffer_list);
+						if (cur_clients[cur_counter].msg_len != 0)
+						{
+							add_to_send(sizeof(uint16_t), 'm', &(cur_clients[cur_counter].msg_len), send_struct->cur_state,
+							&buffer_index, &message_buffer_list_size, message_buffer_list);
+							add_to_send(cur_clients[cur_counter].msg_len, 't', cur_clients[cur_counter].msg, send_struct->cur_state,
+							&buffer_index, &message_buffer_list_size, message_buffer_list);
+						}
 						// message_buffer[buffer_index++] = 'I'; // to indicate ID
 						// memcpy(message_buffer + buffer_index, &(cur_clients[cur_counter].ID), sizeof(int32_t));
 						// buffer_index += 4;
@@ -402,7 +464,7 @@ void* send_func(void* void_in)
 						}
 						
 						// push prev_clients onto the update and inc by 1
-						add_to_send(sizeof(int32_t), 'i', &(cur_clients[cur_counter].ID),
+						add_to_send(sizeof(int32_t), 'i', &(prev_clients[prev_counter].ID), send_struct->cur_state,
 						&buffer_index, &message_buffer_list_size, message_buffer_list);
 
 						// message_buffer[buffer_index++] = 'i'; // to indicate removed ID
@@ -446,6 +508,11 @@ void* send_func(void* void_in)
 			// }
 			for (int b = 0; b < message_buffer_list_size; b++)
 			{
+				if (b == 0)
+				{
+					memcpy(message_buffer_list[0] + 5, &message_buffer_list_size, sizeof(uint32_t)); // send number of packets
+				}
+				
 				if (b == message_buffer_list_size - 1)
 				{
 					//Debug: print the packet
@@ -502,6 +569,22 @@ void* send_func(void* void_in)
 
 }
 
+int Check_Stamp(uint32_t stamp_old, uint32_t stamp_new)
+{
+	if (stamp_old < TIMEOUT_SEC*TICKS_PER_SEC) // case 1
+	{
+		if (stamp_new > stamp_old && stamp_new < stamp_old + TIMEOUT_SEC*TICKS_PER_SEC)
+			return 1;
+	}
+	else if (stamp_old >= TIMEOUT_SEC*TICKS_PER_SEC) // case 2
+	{
+		if (stamp_new > stamp_old || stamp_new < (stamp_old + TIMEOUT_SEC*TICKS_PER_SEC)%TOTAL_STATES)
+			return 1;
+	}
+	
+	return 0;
+}
+
 void* recv_func(void* void_in)
 {
 	struct Recv_Struct* recv_struct = (struct Recv_Struct*)void_in;
@@ -524,7 +607,7 @@ void* recv_func(void* void_in)
 		unsigned int len = sizeof(local_clientaddr);
 
 		unsigned int bytes_read = recvfrom(recv_struct->sockfd, msg_buf, msg_len, 0, (struct sockaddr*)&local_clientaddr, &len);	
-
+		
 		if (bytes_read == sizeof(struct Client_Pkt))
 		{
 			struct Client_Pkt* cpkt = (struct Client_Pkt*)msg_buf;
@@ -556,6 +639,7 @@ void* recv_func(void* void_in)
 					{
 						recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].ID = *(recv_struct->cur_ID);
 						recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].ACK = DUMMY_STATE;
+						recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].stamp = cpkt->stamp;
 						gettimeofday(&(recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].time1), NULL);
 						memcpy(&(recv_struct->clientaddr_array[*(recv_struct->clientaddr_array_filled)]), &local_clientaddr, sizeof(struct sockaddr_in));			
 						recv_struct->len_array[*(recv_struct->clientaddr_array_filled)] = len;
@@ -614,13 +698,17 @@ void* recv_func(void* void_in)
 				{
 					if (cpkt->ID == recv_struct->IDACK_array[i].ID)
 					{
-						recv_struct->len_array[i] = len;
-						recv_struct->IDACK_array[i].ACK = cpkt->ACK;
-						memcpy(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts + i, cpkt, sizeof(struct Client_Pkt));
-						printf("received %f, %f, %f\n", cpkt->x, cpkt->y, cpkt->z);
+						if (Check_Stamp(recv_struct->IDACK_array[i].stamp, cpkt->stamp))
+						{
+							recv_struct->len_array[i] = len;
+							recv_struct->IDACK_array[i].ACK = cpkt->ACK;
+							recv_struct->IDACK_array[i].stamp = cpkt->stamp;
+							memcpy(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts + i, cpkt, sizeof(struct Client_Pkt));
+							printf("received %f, %f, %f\n", cpkt->x, cpkt->y, cpkt->z);
 						
-						gettimeofday(&(recv_struct->IDACK_array[i].time1), NULL);
-						continue;
+							gettimeofday(&(recv_struct->IDACK_array[i].time1), NULL);
+							continue;
+						}
 					}
 				}			
 			}
@@ -630,6 +718,8 @@ void* recv_func(void* void_in)
 			}
 			else if (cpkt->msgtype == 0x03) // text packet. propogate this byte array to all of the players in the session
 			{
+				// i did not use this implementation, i will probably cry later
+				
 				// // open a thread for every player, repeatedly send the text until reception of an ACK.
 				// for (uint32_t i = 0; i < *(send_struct->clientaddr_array_filled); i += 1)
 				// {
@@ -672,23 +762,31 @@ void* cleanup_func(void* void_in)
 		double start = (double) thread_time_1.tv_sec + (double) (thread_time_1.tv_usec)/1000000.0;
 		double end = (double) thread_time_2.tv_sec + (double) (thread_time_2.tv_usec)/1000000.0;
 		if ((end - start) < 1.0) // not yet time to run
+		{
 			sched_yield();
+			continue;
+		}
 		else
 		{
+			pthread_mutex_lock(&lock);
 			for (uint32_t i = 0; i < *(recv_struct->clientaddr_array_filled); i++)
 			{
 				uint32_t cf = *(recv_struct->clientaddr_array_filled);
-				struct timeval time1 = recv_struct->IDACK_array[cf].time1;
+				struct timeval time1 = recv_struct->IDACK_array[i].time1;
 				start = (double) time1.tv_sec + (double) (time1.tv_usec)/1000000.0;
-				if ((end - start) > 10.0) // this player has timed out
+				if (start != 0.0 && (end - start) >= 10.0) // this player has timed out
 				{
+					printf("removing player with ID %d \n", recv_struct->IDACK_array[i].ID);
+
 					remove_elem(recv_struct->IDACK_array, i, cf, sizeof(struct IDACK));
 					remove_elem(recv_struct->clientaddr_array, i, cf, sizeof(struct sockaddr_in));
 					remove_elem(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts, i, cf, sizeof(struct Client_Pkt));
+					recv_struct->state_list[*(recv_struct->cur_state)].num_of_clients -= 1;
 					*(recv_struct->clientaddr_array_filled) -= 1;
 					i -= 1;
 				}
 			}
+			pthread_mutex_unlock(&lock);
 		}
 		
 		gettimeofday(&thread_time_1, NULL);
@@ -789,10 +887,13 @@ int main(int argc, char** argv)
 
     pthread_t recv_thread_id; 
     pthread_t send_thread_id; 
+	pthread_t clean_thread_id;
 	pthread_create(&recv_thread_id, NULL, recv_func, (void*)(&recv_struct));
 	pthread_create(&send_thread_id, NULL, send_func, (void*)(&recv_struct)); 
+	pthread_create(&clean_thread_id, NULL, cleanup_func, (void*)(&recv_struct)); 
     pthread_join(send_thread_id, NULL); 
 	pthread_join(recv_thread_id, NULL); 
+	pthread_join(clean_thread_id, NULL); 
 	pthread_mutex_destroy(&lock);
 	
 	return 0;
