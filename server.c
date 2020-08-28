@@ -34,6 +34,7 @@ pthread_mutex_t lock;
 struct Client_Pkt
 {
 	int32_t ID; // 4 bytes
+	int32_t inst_ID; // 4 bytes
 	float x; // 4 bytes
 	float y; // 4 bytes
 	float z; // 4 bytes
@@ -56,6 +57,13 @@ struct Client_Pkt
 	// brings theoretical total to 24 + 16 + 3 = 43 bytes 
 };
 
+struct Score_Pkt
+{
+	uint8_t msgtype;
+	uint32_t data_ACK;
+	int32_t inst_ID;
+};
+
 struct Server_Pkt // i don't think we'll use a struct for messages from server to client; they'll be structured like a changelog
 {
 	uint8_t msgtype;
@@ -64,8 +72,11 @@ struct Server_Pkt // i don't think we'll use a struct for messages from server t
 struct IDACK
 {
 	int32_t ID;
+	int32_t inst_ID;
 	uint32_t ACK;
+	uint32_t data_ACK; // ack number specifically for atypical packets
 	uint32_t stamp;
+	int32_t score;
 	struct timeval time1;
 };
 
@@ -82,9 +93,12 @@ struct Send_Struct
 	struct sockaddr_in* clientaddr_array;
 	unsigned int* len_array;
 	struct IDACK* IDACK_array;
+	uint8_t* instanced_ID_filled;
 	struct State* state_list;
 	uint32_t* cur_state;
 	uint32_t* cur_ID;
+	uint8_t* send_flag;
+	uint8_t* clean_flag;
 	int sockfd;
 };
 
@@ -95,9 +109,12 @@ struct Recv_Struct
 	struct sockaddr_in* clientaddr_array;
 	unsigned int* len_array;
 	struct IDACK* IDACK_array;
+	uint8_t* instanced_ID_filled;
 	struct State* state_list;
 	uint32_t* cur_state;
 	uint32_t* cur_ID;
+	uint8_t* send_flag;
+	uint8_t* clean_flag;
 	int sockfd; 
 };
 
@@ -229,7 +246,10 @@ void* send_func(void* void_in)
 		if (end - start < (1.0 / 20.0) || *(send_struct->clientaddr_array_filled) == 0)
 			continue;
 		else
+		{
 			gettimeofday(&time1, NULL); // get new initial time
+			//*(send_struct->send_flag) = 1;
+		}
 		
 		pthread_mutex_lock(&lock);
 		
@@ -318,7 +338,7 @@ void* send_func(void* void_in)
 						{
 							// compose diff
 							// increment both by 1
-							add_to_send(sizeof(int32_t), 'I', &(cur_clients[cur_counter].ID), send_struct->cur_state,
+							add_to_send(sizeof(int32_t), 'I', &(cur_clients[cur_counter].inst_ID), send_struct->cur_state,
 							&buffer_index, &message_buffer_list_size, message_buffer_list);
 							
 							// message_buffer[buffer_index++] = 'I'; // to indicate ID
@@ -400,7 +420,7 @@ void* send_func(void* void_in)
 							// 2 3 4
 							// where ID 1 dropped off and is no longer there
 							
-							add_to_send(sizeof(int32_t), 'i', &(prev_clients[prev_counter].ID), send_struct->cur_state,
+							add_to_send(sizeof(int32_t), 'i', &(prev_clients[prev_counter].inst_ID), send_struct->cur_state,
 							&buffer_index, &message_buffer_list_size, message_buffer_list);
 							
 							// message_buffer[buffer_index++] = 'i'; // to indicate removed ID
@@ -420,7 +440,7 @@ void* send_func(void* void_in)
 						
 						// push cur_clients onto the update and inc by 1
 						
-						add_to_send(sizeof(int32_t), 'I', &(cur_clients[cur_counter].ID), send_struct->cur_state,
+						add_to_send(sizeof(int32_t), 'I', &(cur_clients[cur_counter].inst_ID), send_struct->cur_state,
 						&buffer_index, &message_buffer_list_size, message_buffer_list);
 						add_to_send(sizeof(float), 'x', &(cur_clients[cur_counter].x), send_struct->cur_state,
 						&buffer_index, &message_buffer_list_size, message_buffer_list);
@@ -464,7 +484,7 @@ void* send_func(void* void_in)
 						}
 						
 						// push prev_clients onto the update and inc by 1
-						add_to_send(sizeof(int32_t), 'i', &(prev_clients[prev_counter].ID), send_struct->cur_state,
+						add_to_send(sizeof(int32_t), 'i', &(prev_clients[prev_counter].inst_ID), send_struct->cur_state,
 						&buffer_index, &message_buffer_list_size, message_buffer_list);
 
 						// message_buffer[buffer_index++] = 'i'; // to indicate removed ID
@@ -560,6 +580,8 @@ void* send_func(void* void_in)
 		
 		*cur_state_num = next_state_num;
 		
+		//*(send_struct->send_flag) = 0;
+		
 		pthread_mutex_unlock(&lock);
 		
 		gettimeofday(&time1, NULL);
@@ -589,6 +611,11 @@ void* recv_func(void* void_in)
 {
 	struct Recv_Struct* recv_struct = (struct Recv_Struct*)void_in;
 	
+	struct sockaddr_in server_clientaddr;
+	memset(&server_clientaddr, 0, sizeof(struct sockaddr_in));
+	uint8_t server_set = 0;
+	unsigned int server_len = sizeof(server_clientaddr);
+
 	uint8_t* msg_buf;
 	unsigned int msg_len = sizeof(struct Client_Pkt);
 	if ((msg_buf = malloc(sizeof(struct Client_Pkt))) == NULL)
@@ -608,142 +635,227 @@ void* recv_func(void* void_in)
 
 		unsigned int bytes_read = recvfrom(recv_struct->sockfd, msg_buf, msg_len, 0, (struct sockaddr*)&local_clientaddr, &len);	
 		
-		if (bytes_read == sizeof(struct Client_Pkt))
+		uint8_t found_clientaddr = 0;
+		int32_t found_clientaddr_ID = -1;
+		int32_t found_clientaddr_inst_ID = -1;
+		for (uint32_t i = 0; i < *(recv_struct->clientaddr_array_filled); i++)
 		{
-			struct Client_Pkt* cpkt = (struct Client_Pkt*)msg_buf;
-			
-			if (cpkt->msgtype == 0x00) // establishment packet. add info to list if it hasn't already been added, send back ID
+			short rs_short = recv_struct->clientaddr_array[i].sin_family;
+			short lc_short = local_clientaddr.sin_family;
+			unsigned short rs_ushort = recv_struct->clientaddr_array[i].sin_port;
+			unsigned short lc_ushort = local_clientaddr.sin_port;
+			unsigned long rs_ulong = recv_struct->clientaddr_array[i].sin_addr.s_addr;
+			unsigned long lc_ulong = local_clientaddr.sin_addr.s_addr;
+			if (rs_short == lc_short && rs_ushort == lc_ushort && rs_ulong == lc_ulong) // we already have the clientaddr in the list
 			{
-				uint8_t found_clientaddr = 0;
-				int32_t found_clientaddr_ID = -1;
-				for (uint32_t i = 0; i < *(recv_struct->clientaddr_array_filled); i++)
+				found_clientaddr = 1;
+				found_clientaddr_ID = recv_struct->IDACK_array[i].ID;
+				found_clientaddr_inst_ID = recv_struct->IDACK_array[i].inst_ID;
+				recv_struct->len_array[i] = len;
+				break;
+			}
+		}
+		
+		printf("bytes_read: %d\n", bytes_read);
+		
+		if (bytes_read > 0)
+		{
+			// check to see if this is a server establishment
+			// for now we assume that if server hasn't been set yet, then this is the server
+			if (memcmp(&local_clientaddr, &server_clientaddr, sizeof(struct sockaddr_in)) == 0)
+			{
+				// process changes here. right now i'm thinking it's going to be stuff like health,
+				// etc
+			}
+			else if (server_set == 0 && msg_buf[0] == 0xFF)
+			{
+				server_set = 1;
+				server_len = len;
+				memcpy(&server_clientaddr, &local_clientaddr, sizeof(struct sockaddr_in));
+							
+				uint8_t ID_buf[5] = {0}; // 9-byte buffer for sending 1. message type, 2. ID number, and 3. max num of players
+				ID_buf[0] = 0x01; // indicating that this is an ID message.
+				memcpy(ID_buf + 1, recv_struct->clientaddr_array_len, 4); // send the max num of players, too
+				sendto(recv_struct->sockfd, ID_buf, 5, 0, (struct sockaddr*)&server_clientaddr, server_len); // send the message
+			}
+			else if (bytes_read == sizeof(struct Client_Pkt))
+			{				
+				if (server_set == 1)
 				{
-					short rs_short = recv_struct->clientaddr_array[i].sin_family;
-					short lc_short = local_clientaddr.sin_family;
-					unsigned short rs_ushort = recv_struct->clientaddr_array[i].sin_port;
-					unsigned short lc_ushort = local_clientaddr.sin_port;
-					unsigned long rs_ulong = recv_struct->clientaddr_array[i].sin_addr.s_addr;
-					unsigned long lc_ulong = local_clientaddr.sin_addr.s_addr;
-					if (rs_short == lc_short && rs_ushort == lc_ushort && rs_ulong == lc_ulong) // we already have the clientaddr in the list
-					{
-						found_clientaddr = 1;
-						found_clientaddr_ID = recv_struct->IDACK_array[i].ID;
-						recv_struct->len_array[i] = len;
-						break;
-					}
+					sendto(recv_struct->sockfd, msg_buf, msg_len, 0, (struct sockaddr*)&server_clientaddr, server_len); // send the message
 				}
 				
-				if (found_clientaddr == 0) // if the client isn't already in the list . . .
-				{
-					if (*(recv_struct->clientaddr_array_filled) < *(recv_struct->clientaddr_array_len)) // check if we have the max number players. if not, put player on list
+				struct Client_Pkt* cpkt = (struct Client_Pkt*)msg_buf;
+				
+				if (cpkt->msgtype == 0x00) // establishment packet. add info to list if it hasn't already been added, send back ID
+				{					
+					if (found_clientaddr == 0) // if the client isn't already in the list . . .
 					{
-						recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].ID = *(recv_struct->cur_ID);
-						recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].ACK = DUMMY_STATE;
-						recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].stamp = cpkt->stamp;
-						gettimeofday(&(recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].time1), NULL);
-						memcpy(&(recv_struct->clientaddr_array[*(recv_struct->clientaddr_array_filled)]), &local_clientaddr, sizeof(struct sockaddr_in));			
-						recv_struct->len_array[*(recv_struct->clientaddr_array_filled)] = len;
+						if (*(recv_struct->clientaddr_array_filled) < *(recv_struct->clientaddr_array_len)) // check if we have the max number players. if not, put player on list
+						{
+							int32_t cur_instanced_ID = -1;
+							for (int32_t w = 0; w < *(recv_struct->clientaddr_array_len); w++)
+							{
+								if (recv_struct->instanced_ID_filled[w] == 0)
+								{
+									cur_instanced_ID = w;
+									recv_struct->instanced_ID_filled[w] = 1;
+									break;
+								}
+							}
+							
+							recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].ID = *(recv_struct->cur_ID);
+							recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].ACK = DUMMY_STATE;
+							recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].stamp = cpkt->stamp;
+							recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].inst_ID = cur_instanced_ID;
+							gettimeofday(&(recv_struct->IDACK_array[*(recv_struct->clientaddr_array_filled)].time1), NULL);
+							memcpy(&(recv_struct->clientaddr_array[*(recv_struct->clientaddr_array_filled)]), &local_clientaddr, sizeof(struct sockaddr_in));			
+							recv_struct->len_array[*(recv_struct->clientaddr_array_filled)] = len;
 
-						uint32_t cc = recv_struct->state_list[*(recv_struct->cur_state)].num_of_clients;
-						if (cc == 0)
-						{
-							if ((recv_struct->state_list[*(recv_struct->cur_state)].client_pkts = malloc(sizeof(struct Client_Pkt))) == NULL)
+							uint32_t cc = recv_struct->state_list[*(recv_struct->cur_state)].num_of_clients;
+							if (cc == 0)
 							{
-								printf("error with client_pkts malloc in recv_func\n");
-								exit(2);
+								if ((recv_struct->state_list[*(recv_struct->cur_state)].client_pkts = malloc(sizeof(struct Client_Pkt))) == NULL)
+								{
+									printf("error with client_pkts malloc in recv_func\n");
+									exit(2);
+								}
 							}
-						}
-						else 
-						{
-							if ((recv_struct->state_list[*(recv_struct->cur_state)].client_pkts = realloc(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts, sizeof(struct Client_Pkt) * (cc + 1))) == NULL)
+							else 
 							{
-								printf("error with client_pkts realloc in recv_func\n");
-								exit(2);
+								if ((recv_struct->state_list[*(recv_struct->cur_state)].client_pkts = realloc(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts, sizeof(struct Client_Pkt) * (cc + 1))) == NULL)
+								{
+									printf("error with client_pkts realloc in recv_func\n");
+									exit(2);
+								}
 							}
+							recv_struct->state_list[*(recv_struct->cur_state)].num_of_clients += 1;
+							memcpy(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts + cc, cpkt, sizeof(struct Client_Pkt)); // copy the contents of this packet into the state
+							
+							uint8_t ID_buf[13] = {0}; // 9-byte buffer for sending 1. message type, 2. ID number, and 3. max num of players
+							ID_buf[0] = 0x01; // indicating that this is an ID message.
+							memcpy(ID_buf + 1, recv_struct->cur_ID, 4); // copy the literal bytes of the ID from recv_struct->clientaddr_array_filled into our message
+							memcpy(ID_buf + 5, recv_struct->clientaddr_array_len, 4); // send the max num of players, too
+							memcpy(ID_buf + 9, &cur_instanced_ID, 4); // send the 'instanced' ID that the player should use to index into their object arrays
+							sendto(recv_struct->sockfd, ID_buf, 13, 0, (struct sockaddr*)&local_clientaddr, len); // send the message
+							printf("sent initializer packet. ID is %d\n", *recv_struct->cur_ID);
+							
+							*(recv_struct->clientaddr_array_filled) += 1;
+							*(recv_struct->cur_ID) += 1;
 						}
-						recv_struct->state_list[*(recv_struct->cur_state)].num_of_clients += 1;
-						memcpy(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts + cc, cpkt, sizeof(struct Client_Pkt)); // copy the contents of this packet into the state
-						
-						uint8_t ID_buf[9] = {0}; // 9-byte buffer for sending 1. message type, 2. ID number, and 3. max num of players
-						ID_buf[0] = 0x01; // indicating that this is an ID message.
-						memcpy(ID_buf + 1, recv_struct->cur_ID, 4); // copy the literal bytes of the ID from recv_struct->clientaddr_array_filled into our message
+						else 				// if we have max players, then send back error packet
+						{
+							uint8_t ID_buf[1]; // 1-byte buffer for error code
+							ID_buf[0] = 0xFF;
+							sendto(recv_struct->sockfd, ID_buf, 1, 0, (struct sockaddr*)&local_clientaddr, len); // send the message
+						}
+					}
+					else // just send back the player's ID
+					{
+						// same comments as above, only change is that we get ID from found_clientaddr_ID instead of recv_struct->clientaddr_array_filled
+						uint8_t ID_buf[13] = {0};
+						ID_buf[0] = 0x01;
+						memcpy(ID_buf + 1, &found_clientaddr_ID, 4);
 						memcpy(ID_buf + 5, recv_struct->clientaddr_array_len, 4); // send the max num of players, too
-						sendto(recv_struct->sockfd, ID_buf, 9, 0, (struct sockaddr*)&local_clientaddr, len); // send the message
-						printf("sent initializer packet. ID is %d\n", *recv_struct->cur_ID);
-						
-						*(recv_struct->clientaddr_array_filled) += 1;
-						*(recv_struct->cur_ID) += 1;
-					}
-					else 				// if we have max players, then send back error packet
-					{
-						uint8_t ID_buf[1]; // 1-byte buffer for error code
-						ID_buf[0] = 0xFF;
-						sendto(recv_struct->sockfd, ID_buf, 1, 0, (struct sockaddr*)&local_clientaddr, len); // send the message
+						memcpy(ID_buf + 9, &found_clientaddr_inst_ID, 4);
+						sendto(recv_struct->sockfd, ID_buf, 13, 0, (struct sockaddr*)&local_clientaddr, len);
+						printf("sent duplicate ID packet. ID is %d\n", found_clientaddr_ID);
 					}
 				}
-				else // just send back the player's ID
+				else if (cpkt->msgtype == 0x01) // regular packet. update info in list and get ACK number, update timeout timer. don't have to send back anything, hopefully
 				{
-					// same comments as above, only change is that we get ID from found_clientaddr_ID instead of recv_struct->clientaddr_array_filled
-					uint8_t ID_buf[9] = {0};
-					ID_buf[0] = 0x01;
-					memcpy(ID_buf + 1, &found_clientaddr_ID, 4);
-					memcpy(ID_buf + 5, recv_struct->clientaddr_array_len, 4); // send the max num of players, too
-					sendto(recv_struct->sockfd, ID_buf, 9, 0, (struct sockaddr*)&local_clientaddr, len);
-					printf("sent duplicate ID packet. ID is %d\n", found_clientaddr_ID);
+					for (uint32_t i = 0; i < *(recv_struct->clientaddr_array_filled); i++)
+					{
+						if (cpkt->ID == recv_struct->IDACK_array[i].ID)
+						{
+							if (Check_Stamp(recv_struct->IDACK_array[i].stamp, cpkt->stamp))
+							{
+								recv_struct->len_array[i] = len;
+								recv_struct->IDACK_array[i].ACK = cpkt->ACK;
+								recv_struct->IDACK_array[i].stamp = cpkt->stamp;
+								memcpy(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts + i, cpkt, sizeof(struct Client_Pkt));
+								printf("received %f, %f, %f\n", cpkt->x, cpkt->y, cpkt->z);
+							
+								gettimeofday(&(recv_struct->IDACK_array[i].time1), NULL);
+								continue;
+							}
+						}
+					}			
+				}
+				else if (cpkt->msgtype == 0x02) // exit packet. remove player from IDACK and clientaddr lists
+				{
+					
+				}
+				else if (cpkt->msgtype == 0x03) // text packet. propogate this byte array to all of the players in the session
+				{
+					// i did not use this implementation, i will probably cry later
+					
+					// // open a thread for every player, repeatedly send the text until reception of an ACK.
+					// for (uint32_t i = 0; i < *(send_struct->clientaddr_array_filled); i += 1)
+					// {
+						// pthread_t* text_thread_id; // have to malloc pthread_t because it'll get destroyed on thread loop otherwise
+						// if ((text_thread_id = malloc(sizeof(pthread_t))) == NULL) 
+						// {
+							// printf("error with client_pkts malloc in recv_func\n");
+							// exit(2);
+						// }
+						// // to avoid holding the mutex during message propagation, we're going to do some dirty gross stuff:
+						// pass in copies of the fields that sendto() needs
+						
+						// pthread_create(text_thread_id, NULL, text_func, (void*)(&text_struct));
+					// }
 				}
 			}
-			else if (cpkt->msgtype == 0x01) // regular packet. update info in list and get ACK number, update timeout timer. don't have to send back anything, hopefully
+			else // control packets
 			{
-				for (uint32_t i = 0; i < *(recv_struct->clientaddr_array_filled); i++)
-				{
-					if (cpkt->ID == recv_struct->IDACK_array[i].ID)
+				if (msg_buf[0] == 0x04) // score packet
+			 	{
+					struct Score_Pkt* spkt = (struct Score_Pkt*)msg_buf;
+					
+					// first, check if the player to add a point to is the one sending the packet. if so, ignore
+					for (uint32_t i = 0; i < *(recv_struct->clientaddr_array_filled); i++)
 					{
-						if (Check_Stamp(recv_struct->IDACK_array[i].stamp, cpkt->stamp))
+						if (spkt->inst_ID == recv_struct->IDACK_array[i].inst_ID) // find matching instance ID
 						{
-							recv_struct->len_array[i] = len;
-							recv_struct->IDACK_array[i].ACK = cpkt->ACK;
-							recv_struct->IDACK_array[i].stamp = cpkt->stamp;
-							memcpy(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts + i, cpkt, sizeof(struct Client_Pkt));
-							printf("received %f, %f, %f\n", cpkt->x, cpkt->y, cpkt->z);
-						
-							gettimeofday(&(recv_struct->IDACK_array[i].time1), NULL);
-							continue;
+							if (memcmp(&(recv_struct->clientaddr_array[i]), &local_clientaddr, sizeof(struct sockaddr_in)) == 0)
+								break;
+							
+							if (spkt->data_ACK == recv_struct->IDACK_array[i].data_ACK)
+							{
+								recv_struct->IDACK_array[i].data_ACK += 1;
+								recv_struct->IDACK_array[i].score += 1;
+							}
+							else if (spkt->data_ACK > recv_struct->IDACK_array[i].data_ACK) // if the client is prematurely sending bigger data_ACKs than what we expect, we'll deal with them later
+								break;
+														
+							uint8_t score_buf[5] = {0};
+							score_buf[0] = 0x10;
+							memcpy(score_buf + 1, &(spkt->data_ACK), 4);
+							sendto(recv_struct->sockfd, score_buf, 5, 0, (struct sockaddr*)&local_clientaddr, len);
+							
+							break;
 						}
 					}
-				}			
-			}
-			else if (cpkt->msgtype == 0x02) // exit packet. remove player from IDACK and clientaddr lists
-			{
+				}
 				
-			}
-			else if (cpkt->msgtype == 0x03) // text packet. propogate this byte array to all of the players in the session
-			{
-				// i did not use this implementation, i will probably cry later
-				
-				// // open a thread for every player, repeatedly send the text until reception of an ACK.
-				// for (uint32_t i = 0; i < *(send_struct->clientaddr_array_filled); i += 1)
-				// {
-					// pthread_t* text_thread_id; // have to malloc pthread_t because it'll get destroyed on thread loop otherwise
-					// if ((text_thread_id = malloc(sizeof(pthread_t))) == NULL) 
-					// {
-						// printf("error with client_pkts malloc in recv_func\n");
-						// exit(2);
-					// }
-					// // to avoid holding the mutex during message propagation, we're going to do some dirty gross stuff:
-					// pass in copies of the fields that sendto() needs
-					
-					// pthread_create(text_thread_id, NULL, text_func, (void*)(&text_struct));
-				// }
 			}
 		} 
-		else 
-		{
-			pthread_mutex_unlock(&lock);
+		else // nothing to recieve
+		{			
+			//if (*(recv_struct->send_flag) == 1 || *(recv_struct->clean_flag) == 1)
+			//{
+				pthread_mutex_unlock(&lock);
+				sched_yield();
+			//}
+
 			continue;
 		}
-		pthread_mutex_unlock(&lock);
 		
-		usleep(2000);
+		//if (*(recv_struct->send_flag) == 1 || *(recv_struct->clean_flag) == 1)
+		//{
+			pthread_mutex_unlock(&lock);
+			sched_yield();
+		//}
 	}
 
 	return NULL;
@@ -768,6 +880,7 @@ void* cleanup_func(void* void_in)
 		}
 		else
 		{
+			//*(recv_struct->clean_flag) = 1;
 			pthread_mutex_lock(&lock);
 			for (uint32_t i = 0; i < *(recv_struct->clientaddr_array_filled); i++)
 			{
@@ -778,6 +891,8 @@ void* cleanup_func(void* void_in)
 				{
 					printf("removing player with ID %d \n", recv_struct->IDACK_array[i].ID);
 
+					recv_struct->instanced_ID_filled[recv_struct->IDACK_array[i].inst_ID] = 0;
+
 					remove_elem(recv_struct->IDACK_array, i, cf, sizeof(struct IDACK));
 					remove_elem(recv_struct->clientaddr_array, i, cf, sizeof(struct sockaddr_in));
 					remove_elem(recv_struct->state_list[*(recv_struct->cur_state)].client_pkts, i, cf, sizeof(struct Client_Pkt));
@@ -786,6 +901,7 @@ void* cleanup_func(void* void_in)
 					i -= 1;
 				}
 			}
+			//*(recv_struct->clean_flag) = 0;
 			pthread_mutex_unlock(&lock);
 		}
 		
@@ -835,7 +951,10 @@ int main(int argc, char** argv)
 	{
 		printf("cannot bind()");
 		exit(1);
-	}		
+	}
+	
+	int flags = fcntl(sockfd, F_GETFL, 0);
+	fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
 				
 	// ideally, run a different thread for each client. thread handles message sending to the client 
 	// (can get ACKs, send only diff data [I don't think sending diff'd memory chunks like quake 3 is 
@@ -847,11 +966,20 @@ int main(int argc, char** argv)
 	
 	uint32_t cur_state = 0;
 	uint32_t cur_ID = 0;
+	uint8_t send_flag = 0;
+	uint8_t clean_flag = 0;
 	
 	struct IDACK* IDACK_array;
 	if ((IDACK_array = malloc(sizeof(struct IDACK) * clientaddr_array_len)) == NULL)
 	{
 		printf("malloc of IDACK_array broke, exiting\n");
+		return 1;
+	}
+	
+	uint8_t* instanced_ID_filled;
+	if ((instanced_ID_filled = malloc(sizeof(uint8_t) * clientaddr_array_len)) == NULL)
+	{
+		printf("malloc of instanced_ID_filled broke, exiting\n");
 		return 1;
 	}
 	
@@ -874,9 +1002,12 @@ int main(int argc, char** argv)
 	recv_struct.clientaddr_array = clientaddr_array;
 	recv_struct.len_array = len_array;
 	recv_struct.IDACK_array = IDACK_array;
+	recv_struct.instanced_ID_filled = instanced_ID_filled;
 	recv_struct.state_list = state_list;
 	recv_struct.cur_state = &cur_state;
 	recv_struct.cur_ID = &cur_ID;
+	recv_struct.send_flag = &send_flag;
+	recv_struct.clean_flag = &clean_flag;
 	recv_struct.sockfd = sockfd;	
 
     if (pthread_mutex_init(&lock, NULL) != 0)
